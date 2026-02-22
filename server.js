@@ -1,10 +1,10 @@
 /**
  * Node.js server for STM32 Robot Control
  *
- * Browser  <──WebSocket──>  Server  <──HTTP──>  ESP32  <──UART──>  STM32
+ * Browser  <──WebSocket──>  Server  <──WebSocket──>  ESP32  <──UART──>  STM32
  *
- * - Browser connects via WebSocket: real-time events push + commands
- * - ESP32 still uses HTTP: POST /data (telemetry), GET /command (polling)
+ * - Browser connects via WS: receives events, sends commands
+ * - ESP32 connects via WS to /ws: registers, sends telemetry, receives commands
  */
 
 require('dotenv').config();
@@ -21,37 +21,86 @@ const PORT   = process.env.PORT || 3000;
 app.use(express.json());
 
 const recentEvents = [];   // last 100 events, for history on new connections
-let   pendingCommand = null;
 let   eventSeq = 0;
+let   esp32Socket = null;  // WebSocket connection from ESP32
 
 // ============================================================================
-// WEBSOCKET  (browser ↔ server)
+// WEBSOCKET  (browser ↔ server ↔ ESP32)
 // ============================================================================
 
-function broadcast(msg) {
-    const str = JSON.stringify(msg);
+function broadcastToBrowsers(msg) {
+    const str = typeof msg === 'string' ? msg : JSON.stringify(msg);
     wss.clients.forEach(client => {
-        if (client.readyState === 1 /* OPEN */) client.send(str);
+        if (client !== esp32Socket && client.readyState === 1 /* OPEN */) {
+            client.send(str);
+        }
     });
 }
 
-wss.on('connection', ws => {
-    console.log(`[WS] Client connected  (total: ${wss.clients.size})`);
+wss.on('connection', (ws, req) => {
+    const ip = req.socket.remoteAddress;
+    console.log(`[WS] Client connected from ${ip} (total: ${wss.clients.size})`);
 
-    // Send history so the dashboard isn't blank on page load
+    // Send history to all new connections (ESP32 will ignore unknown message types)
     ws.send(JSON.stringify({ type: 'history', events: recentEvents.slice(-30) }));
 
     ws.on('message', raw => {
-        try {
-            const msg = JSON.parse(raw);
-            if (msg.type === 'command') {
-                pendingCommand = { action: msg.action, speed: msg.speed };
+        let msg;
+        try { msg = JSON.parse(raw); } catch (_) { return; }
+
+        // ESP32 registration
+        if (msg.type === 'register' && msg.device === 'esp32') {
+            esp32Socket = ws;
+            console.log(`[WS] ESP32 registered`);
+            broadcastToBrowsers({ type: 'esp32_status', connected: true });
+            return;
+        }
+
+        // Message from ESP32 (telemetry forwarded from STM32)
+        if (ws === esp32Socket) {
+            if (msg.type === 'telemetry') {
+                const data = { ...msg };
+                delete data.type;
+                const timestamp = new Date().toISOString();
+                const event = { seq: ++eventSeq, time: timestamp.slice(11, 19), data };
+                recentEvents.push(event);
+                if (recentEvents.length > 100) recentEvents.shift();
+                broadcastToBrowsers({ type: 'event', ...event });
+
+                if (data.button !== undefined)
+                    console.log(`[${event.time}] BTN_${data.button}: ${data.state}`);
+                else if (data.motor !== undefined)
+                    console.log(`[${event.time}] Motor ${data.motor}: ${data.direction} ${data.speed}%`);
             }
-        } catch (_) {}
+            return;
+        }
+
+        // Message from browser: forward command directly to ESP32
+        if (msg.type === 'command') {
+            if (esp32Socket && esp32Socket.readyState === 1 /* OPEN */) {
+                esp32Socket.send(JSON.stringify({
+                    type:   'command',
+                    action: msg.action,
+                    speed:  msg.speed,
+                    id:     msg.id,
+                    dir:    msg.dir
+                }));
+            }
+        }
     });
 
     ws.on('close', () => {
-        console.log(`[WS] Client disconnected (total: ${wss.clients.size})`);
+        if (ws === esp32Socket) {
+            esp32Socket = null;
+            console.log(`[WS] ESP32 disconnected`);
+            broadcastToBrowsers({ type: 'esp32_status', connected: false });
+        } else {
+            console.log(`[WS] Browser disconnected (total: ${wss.clients.size})`);
+        }
+    });
+
+    ws.on('error', () => {
+        if (ws === esp32Socket) esp32Socket = null;
     });
 });
 
@@ -326,11 +375,12 @@ var ant = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.01, 0.35, 6), new TH
 ant.position.set(0.3, 1.23, -0.5); car.add(ant);
 
 // --- Wheels ---
+// M0=LEFT-FRONT, M1=LEFT-REAR (Driver1), M2=RIGHT-FRONT, M3=RIGHT-REAR (Driver2)
 var wheelDefs = [
-    { x: -1.08, y: 0.36, z:  1.05, id: 0 },
-    { x:  1.08, y: 0.36, z:  1.05, id: 1 },
-    { x: -1.08, y: 0.36, z: -1.05, id: 2 },
-    { x:  1.08, y: 0.36, z: -1.05, id: 3 }
+    { x: -1.08, y: 0.36, z:  1.05, id: 0 },  // M0 LEFT-FRONT
+    { x: -1.08, y: 0.36, z: -1.05, id: 1 },  // M1 LEFT-REAR
+    { x:  1.08, y: 0.36, z:  1.05, id: 2 },  // M2 RIGHT-FRONT
+    { x:  1.08, y: 0.36, z: -1.05, id: 3 }   // M3 RIGHT-REAR
 ];
 var pivots = [], glowLights = [], tireMats = [];
 
@@ -417,7 +467,7 @@ function animate() {
         var m = mState[i];
         if (m.spd > 0) {
             var step = (m.spd / 100) * 0.055;
-            pivots[i].rotation.x += m.dir === 'forward' ? -step : step;
+            pivots[i].rotation.x += m.dir === 'forward' ? step : -step;
         }
     }
     orbitControls.update();
@@ -507,7 +557,8 @@ document.addEventListener('keyup', function(e) {
 
 function applyLocalCommand(action, spd) {
     var f = {dir:'forward',spd:spd}, b = {dir:'backward',spd:spd}, s = {dir:'stop',spd:0};
-    var map = { forward:[f,f,f,f], backward:[b,b,b,b], left:[b,f,b,f], right:[f,b,f,b], stop:[s,s,s,s] };
+    // Motor layout: M0=L-front, M1=L-rear, M2=R-front, M3=R-rear
+    var map = { forward:[f,f,f,f], backward:[b,b,b,b], left:[b,b,f,f], right:[f,f,b,b], stop:[s,s,s,s] };
     var states = map[action] || map.stop;
     for (var i = 0; i < 4; i++) { mState[i] = states[i]; updateMotorVisual(i, states[i].dir, states[i].spd); }
     if (action === 'forward')        worldVelocity =  (spd / 100) * 0.1;
@@ -569,35 +620,12 @@ function addLog(data) {
 
 app.get('/', (_, res) => res.send(HTML));
 
-// ESP32 sends telemetry here → broadcast to all WS clients instantly
-app.post('/data', (req, res) => {
-    const timestamp = new Date().toISOString();
-    if (req.body && Object.keys(req.body).length > 0) {
-        const event = { seq: ++eventSeq, time: timestamp.slice(11, 19), data: req.body };
-        recentEvents.push(event);
-        if (recentEvents.length > 100) recentEvents.shift();
-
-        // Push to all connected browsers in real time
-        broadcast({ type: 'event', ...event });
-
-        if (req.body.button !== undefined)
-            console.log(`[${timestamp.slice(11,19)}] BTN_${req.body.button}: ${req.body.state}`);
-        else if (req.body.motor !== undefined)
-            console.log(`[${timestamp.slice(11,19)}] Motor ${req.body.motor}: ${req.body.direction} ${req.body.speed}%`);
-    }
-    res.json({ status: 'OK', timestamp });
-});
-
-// ESP32 polls this every 200ms for commands
-app.get('/command', (_, res) => {
-    const cmd = pendingCommand;
-    pendingCommand = null;
-    res.json(cmd || {});
-});
-
 app.get('/status', (_, res) => res.json({
-    status: 'running', uptime: process.uptime(),
-    clients: wss.clients.size, events: recentEvents.length
+    status:      'running',
+    uptime:      process.uptime(),
+    browsers:    [...wss.clients].filter(c => c !== esp32Socket && c.readyState === 1).length,
+    esp32:       esp32Socket ? 'connected' : 'disconnected',
+    events:      recentEvents.length
 }));
 
 app.use((_, res) => res.status(404).send('404'));
