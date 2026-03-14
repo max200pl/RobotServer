@@ -19,6 +19,7 @@ const wss    = new WebSocketServer({ server });
 const PORT   = process.env.PORT || 3000;
 
 app.use(express.json());
+app.use((_, res, next) => { res.setHeader('bypass-tunnel-reminder', 'true'); res.setHeader('ngrok-skip-browser-warning', 'true'); next(); });
 
 const recentEvents = [];   // last 100 events, for history on new connections
 let   eventSeq = 0;
